@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import { pathToFileURL } from 'node:url'
 
 const HOST = '127.0.0.1'
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1'])
 const DEFAULT_PORT = 17860
 const CLIENT_ID = 'dsh-desktop'
 const DEFAULT_CONTRACT_VERSION = '0.5.0'
@@ -10,7 +11,7 @@ const AUTH_TTL_MS = 5 * 60 * 1000
 const TICKET_TTL_MS = 60 * 1000
 const ACCESS_TTL_SECONDS = 300
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
-const MAX_BODY = 128 * 1024
+const MAX_BODY = 8 * 1024 * 1024
 
 const EMPLOYEE_MODELS = [
   'bisheng:42',
@@ -131,6 +132,7 @@ async function readBody(request) {
     if (size > MAX_BODY) throw Object.assign(new Error('request too large'), { status: 413 })
     chunks.push(bytes)
   }
+  console.log(`[bisheng-mock] body ${size} bytes for ${request.url ?? '?'}`)
   return Buffer.concat(chunks).toString('utf8')
 }
 
@@ -216,11 +218,24 @@ function sessionFromAccess(state, request) {
 }
 
 /**
+ * The packaged desktop build rejects loopback HTTP and only accepts an
+ * explicitly-confirmed RFC1918 origin, so a LAN bind is needed to exercise it.
+ * Public addresses stay refused.
+ */
+function isPrivateBindHost(host) {
+  if (LOOPBACK_HOSTS.has(host)) return true
+  const octets = host.split('.')
+  if (octets.length !== 4 || octets.some((part) => !/^\d{1,3}$/.test(part))) return false
+  const [first, second] = octets.map(Number)
+  return first === 10 || (first === 192 && second === 168) || (first === 172 && second >= 16 && second <= 31)
+}
+
+/**
  * @param {{ host?: string, port?: number, contractVersion?: '0.4.0' | '0.5.0' }} [options]
  */
 export function createMockEnterpriseServer(options = {}) {
   const host = options.host ?? HOST
-  if (host !== HOST) throw new Error('The BiSheng mock must bind to 127.0.0.1.')
+  if (!isPrivateBindHost(host)) throw new Error('The BiSheng mock only binds to loopback or a private-network address.')
   const contractVersion = options.contractVersion ?? DEFAULT_CONTRACT_VERSION
   const state = {
     origin: '', authorizations: new Map(), tickets: new Map(), sessions: new Map(),
@@ -234,6 +249,24 @@ export function createMockEnterpriseServer(options = {}) {
       if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { ok: true, origin: state.origin }, id)
       if (request.method === 'GET' && url.pathname === '/') return sendHtml(response, 200, layout('BiSheng DSH Mock', `<span class="tag">READY</span><h1>DSH 登录与模型 Mock</h1><div class="facts"><div><span>BASE</span><strong>${escapeHtml(state.origin)}</strong></div><div><span>合同版本</span><strong>${contractVersion}</strong></div></div><p>在 DSH Desktop Dev 的「设置 → 账号与企业」中填写此 BASE。</p>`))
       if (request.method === 'GET' && url.pathname === '/api/v1/dsh/config') return sendJson(response, 200, { enabled: true, client_id: CLIENT_ID, contract_version: contractVersion }, id)
+
+      // Admin stand-in: change a user's entitlement while their session is alive.
+      // ponytail: unauthenticated mutating route on a LAN-bound test mock; gate it if this ever leaves a lab network.
+      if (request.method === 'POST' && url.pathname === '/__mock/set-models') {
+        const body = await readJson(request)
+        const user = state.users.get(String(body?.user ?? ''))
+        if (!user) return sendError(response, 404, 'unknown_user', 'Unknown user.', 'invalid_request_error', id)
+        if (body?.models !== undefined) {
+          user.models = Array.isArray(body.models) ? body.models.filter((model) => model in MODELS) : []
+        }
+        if (typeof body?.model === 'string' && body.model in MODELS && Number.isFinite(Number(body?.limit))) {
+          MODEL_LIMITS[body.model] = Number(body.limit)
+        }
+        return sendJson(response, 200, {
+          ok: true, user: user.id, models: user.models,
+          limit: body?.model in MODELS ? MODEL_LIMITS[String(body.model)] : undefined
+        }, id)
+      }
 
       if (request.method === 'POST' && url.pathname === '/api/dsh/authorizations') {
         const body = await readJson(request)
@@ -342,6 +375,10 @@ export function createMockEnterpriseServer(options = {}) {
         const body = await readJson(request)
         const user = state.users.get(session.userId)
         if (!user.models.includes(body.model)) return sendError(response, 403, 'model_not_allowed', 'Model is not assigned to this user.', 'permission_error', id)
+        const entitled = state.usage.get(session.id)?.models.get(body.model) ?? 0
+        if (MODEL_LIMITS[body.model] !== undefined && entitled >= MODEL_LIMITS[body.model]) {
+          return sendError(response, 429, 'quota_exhausted', 'Monthly quota for this model is exhausted.', 'rate_limit_error', id)
+        }
         if (body.stream !== true || body.stream_options?.include_usage !== true) return sendError(response, 400, 'invalid_request', 'Streaming with usage is required.', 'invalid_request_error', id)
         const prompt = JSON.stringify(body.messages ?? []).length % 40 + 12
         const completion = 24
@@ -403,7 +440,7 @@ export function createMockEnterpriseServer(options = {}) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const service = createMockEnterpriseServer()
+  const service = createMockEnterpriseServer({ host: process.env.DSH_MOCK_ENTERPRISE_HOST })
   const origin = await service.listen()
   process.stdout.write(`BiSheng DSH Mock listening at ${origin}\n`)
   process.stdout.write('DSH Desktop Dev: Settings -> Account & Enterprise -> enter this BASE\n')
