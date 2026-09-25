@@ -8,10 +8,10 @@
 npm run mock:enterprise
 ```
 
-本仓库的本地改动把 Mock 改为监听 `192.168.50.233:17860`（`DSH_MOCK_ENTERPRISE_HOST` 可覆盖，仅允许回环或 RFC1918 私网地址）。在「设置 → 账号与企业」填写：
+本地联调把 Mock 改为监听 `<本机局域网 IP>:17860`（`DSH_MOCK_ENTERPRISE_HOST` 可覆盖，仅允许回环或 RFC1918 私网地址；不要把真实内网地址提交进仓库）。在「设置 → 账号与企业」填写：
 
 ```text
-http://192.168.50.233:17860
+http://<本机局域网 IP>:17860
 ```
 
 改用内网地址是因为打包版按 `!app.isPackaged` 判定，只接受 HTTPS 或经确认的内网 HTTP，连不上 `127.0.0.1`。主机名 HTTP 和公网 HTTP 一律拒绝。
